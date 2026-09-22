@@ -180,6 +180,78 @@ class CompareResponse(StrictModel):
     intervals: list[CompareInterval] = Field(default_factory=list)
 
 
+class QualityGateRequest(StrictModel):
+    """Quality-gate parameters for one sensor of a batch."""
+
+    sensor_id: SensorId
+    # Inclusive allowed-value bounds; at least one is required and a
+    # calibrated value exactly on a bound is in spec.
+    min_value: Optional[float] = None
+    max_value: Optional[float] = None
+    # Minimum sustained out-of-bounds duration (nanoseconds) before a
+    # candidate run is reported as a violation.
+    min_duration_ns: int = Field(ge=1)
+    # How withdrawn/uncovered/blocked spans are treated:
+    # ignore: not recorded, verdict unaffected;
+    # warn:   recorded as gaps, verdict unaffected;
+    # fail:   recorded as gaps and any gap fails the gate.
+    # Gap spans break out-of-bounds runs and never merge into them,
+    # regardless of the policy.
+    missing_policy: Literal["ignore", "warn", "fail"] = "warn"
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> "QualityGateRequest":
+        if self.min_value is None and self.max_value is None:
+            raise ValueError("at least one of min_value and max_value is required")
+        if (
+            self.min_value is not None
+            and self.max_value is not None
+            and self.min_value > self.max_value
+        ):
+            raise ValueError("min_value must be less than or equal to max_value")
+        return self
+
+
+class ViolationInterval(StrictModel):
+    """One sustained out-of-bounds run on the folded timeline."""
+
+    start_ns: int
+    end_ns: int
+    duration_ns: int
+    # Extreme calibrated values observed inside the run.
+    observed_min: float
+    observed_max: float
+
+
+class GapInterval(StrictModel):
+    """One maximal span the quality gate could not evaluate."""
+
+    start_ns: int
+    end_ns: int
+    duration_ns: int
+    # withdrawn: a tombstone segment wins the fold on the span;
+    # uncovered: no grounded segment covers the span;
+    # blocked:   a not-yet-grounded revision covers the span (precedence).
+    state: Literal["withdrawn", "uncovered", "blocked"]
+
+
+class QualityGateResponse(StrictModel):
+    """Quality-gate verdict for one sensor of a batch."""
+
+    batch_id: str
+    sensor_id: str
+    # False when any violation was detected, or when missing_policy="fail"
+    # and at least one gap was recorded.
+    passed: bool
+    violations: list[ViolationInterval] = Field(default_factory=list)
+    gaps: list[GapInterval] = Field(default_factory=list)
+    # Content hash of the scanned sensor's folded segments (matches the
+    # per-sensor segments_hash of the batch result).
+    segments_hash: str
+    # Batch-level hash, identical to the batch result's timeline_hash.
+    timeline_hash: str
+
+
 class IngestResponse(StrictModel):
     status: Literal["accepted", "duplicate", "conflict"]
     idempotency_key: str

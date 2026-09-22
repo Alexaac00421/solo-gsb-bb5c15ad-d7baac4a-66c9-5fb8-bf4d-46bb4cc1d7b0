@@ -10,7 +10,9 @@ from app.engine import (
     compare_segments,
     compare_sensor,
     evaluate_batch,
+    evaluate_quality_gate,
     query_sample,
+    scan_quality_gate,
 )
 from app.storage import BatchStore, StoredEvent
 
@@ -129,6 +131,148 @@ def test_query_sample_blocked_wins_over_grounded_and_skips_invalid():
     # A point covered only by invalid (cyclic) revisions is resolved normally.
     assert query_sample("S", 85, events, states, depths)["value"] == 0.0
     assert query_sample("S", 85, events, states, depths)["revision_id"] == "root"
+
+
+# ---------------------------------------------------------------------------
+# Quality gate
+# ---------------------------------------------------------------------------
+
+
+def test_scan_merges_abutting_out_of_bounds_segments():
+    segments = [
+        Segment(0, 10, "calibrated", 5.0, "u", "v1"),
+        Segment(10, 25, "calibrated", 6.0, "u", "v2"),
+        Segment(25, 40, "calibrated", 1.0, "u", "v3"),
+    ]
+    violations, gaps = scan_quality_gate(segments, [], 0.0, 4.0, 20, True)
+    assert violations == [
+        {
+            "start_ns": 0,
+            "end_ns": 25,
+            "duration_ns": 25,
+            "observed_min": 5.0,
+            "observed_max": 6.0,
+        }
+    ]
+    assert gaps == []
+
+
+def test_scan_drops_candidates_shorter_than_min_duration():
+    segments = [Segment(0, 10, "calibrated", 9.0, "u", "v1")]
+    violations, _ = scan_quality_gate(segments, [], 0.0, 4.0, 11, True)
+    assert violations == []
+    # A run lasting exactly the threshold is a violation.
+    violations, _ = scan_quality_gate(segments, [], 0.0, 4.0, 10, True)
+    assert [v["duration_ns"] for v in violations] == [10]
+
+
+def test_scan_gaps_break_runs_and_never_merge():
+    # OOB [0,10) -> withdrawn [10,20) -> OOB [20,30): two 10ns candidates.
+    segments = [
+        Segment(0, 10, "calibrated", 9.0, "u", "v1"),
+        Segment(10, 20, "withdrawn", None, None, "w1"),
+        Segment(20, 30, "calibrated", 9.0, "u", "v2"),
+    ]
+    violations, gaps = scan_quality_gate(segments, [], 0.0, 4.0, 15, True)
+    assert violations == []
+    assert [(g["start_ns"], g["end_ns"], g["state"]) for g in gaps] == [
+        (10, 20, "withdrawn")
+    ]
+    # With a low enough threshold both candidates become separate violations.
+    violations, _ = scan_quality_gate(segments, [], 0.0, 4.0, 10, True)
+    assert [(v["start_ns"], v["end_ns"]) for v in violations] == [(0, 10), (20, 30)]
+
+
+def test_scan_uncovered_holes_and_blocked_spans_are_gaps():
+    segments = [
+        Segment(0, 10, "calibrated", 1.0, "u", "v1"),
+        Segment(30, 40, "calibrated", 1.0, "u", "v2"),
+    ]
+    violations, gaps = scan_quality_gate(segments, [(20, 30)], 0.0, 4.0, 5, True)
+    assert violations == []
+    assert [(g["start_ns"], g["end_ns"], g["state"]) for g in gaps] == [
+        (10, 20, "uncovered"),
+        (20, 30, "blocked"),
+    ]
+
+
+def test_scan_blocked_takes_precedence_over_calibrated():
+    segments = [Segment(0, 20, "calibrated", 9.0, "u", "v1")]  # OOB throughout
+    violations, gaps = scan_quality_gate(segments, [(5, 15)], 0.0, 4.0, 10, True)
+    # The blocked span splits the OOB run into two 5ns candidates.
+    assert violations == []
+    assert [(g["start_ns"], g["end_ns"], g["state"]) for g in gaps] == [
+        (5, 15, "blocked")
+    ]
+
+
+def test_scan_adjacent_same_state_gaps_merge_across_revisions():
+    segments = [
+        Segment(0, 10, "withdrawn", None, None, "w1"),
+        Segment(10, 20, "withdrawn", None, None, "w2"),
+    ]
+    _, gaps = scan_quality_gate(segments, [], 0.0, 4.0, 5, True)
+    assert [(g["start_ns"], g["end_ns"], g["state"]) for g in gaps] == [
+        (0, 20, "withdrawn")
+    ]
+
+
+def test_scan_record_gaps_false_drops_gap_intervals():
+    segments = [Segment(0, 10, "withdrawn", None, None, "w1")]
+    _, gaps = scan_quality_gate(segments, [], 0.0, 4.0, 5, False)
+    assert gaps == []
+
+
+def test_scan_bounds_are_inclusive():
+    segments = [Segment(0, 10, "calibrated", 4.0, "u", "v1")]
+    violations, _ = scan_quality_gate(segments, [], 0.0, 4.0, 1, True)
+    assert violations == []
+
+
+def _gate_store(events):
+    store = BatchStore()
+    for e in events:
+        store.events[e.revision_id] = e
+    return store
+
+
+def test_evaluate_quality_gate_unknown_sensor_returns_none():
+    store = _gate_store([_ev("v1", "ROOT", 0, 10, value=1.0)])
+    assert evaluate_quality_gate("B", "OTHER", 0.0, 2.0, 1, "warn", store) is None
+
+
+def test_evaluate_quality_gate_pass_fail_and_hashes():
+    events = [
+        _ev("v1", "ROOT", 0, 100, value=1.0),
+        _ev("v2", "v1", 10, 30, value=9.0),  # 20ns above the max
+    ]
+    store = _gate_store(events)
+    doc = evaluate_quality_gate("B", "S", 0.0, 5.0, 10, "warn", store)
+    assert doc["passed"] is False
+    assert [
+        (v["start_ns"], v["end_ns"], v["duration_ns"]) for v in doc["violations"]
+    ] == [(10, 30, 20)]
+    assert doc["gaps"] == []
+    batch = evaluate_batch("B", store)
+    assert doc["segments_hash"] == batch["sensors"][0]["segments_hash"]
+    assert doc["timeline_hash"] == batch["timeline_hash"]
+
+
+def test_evaluate_quality_gate_missing_policies():
+    events = [
+        _ev("v1", "ROOT", 0, 10, value=1.0),
+        _ev("w", "v1", 10, 20, withdrawn=True),
+    ]
+    store = _gate_store(events)
+    ignored = evaluate_quality_gate("B", "S", 0.0, 5.0, 1, "ignore", store)
+    assert ignored["passed"] is True and ignored["gaps"] == []
+    warned = evaluate_quality_gate("B", "S", 0.0, 5.0, 1, "warn", store)
+    assert warned["passed"] is True
+    assert [(g["start_ns"], g["end_ns"], g["state"]) for g in warned["gaps"]] == [
+        (10, 20, "withdrawn")
+    ]
+    failed = evaluate_quality_gate("B", "S", 0.0, 5.0, 1, "fail", store)
+    assert failed["passed"] is False and failed["violations"] == []
 
 
 # ---------------------------------------------------------------------------

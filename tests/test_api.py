@@ -309,6 +309,166 @@ def test_sample_rejects_negative_timestamp(client):
 
 
 # ---------------------------------------------------------------------------
+# Quality gate
+# ---------------------------------------------------------------------------
+
+
+def _gate(client, batch="B1", **overrides):
+    body = {
+        "sensor_id": "S1",
+        "min_value": 0.0,
+        "max_value": 4.0,
+        "min_duration_ns": 10,
+        "missing_policy": "warn",
+    }
+    body.update(overrides)
+    return client.post(f"/api/v1/batches/{batch}/quality-gate", json=body)
+
+
+def test_quality_gate_passes_when_all_values_in_bounds(client):
+    _post(client, _event("v1", "ROOT", 0, 100, value=1.0))
+    _post(client, _event("v2", "v1", 10, 20, value=3.0))
+    r = _gate(client)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["passed"] is True
+    assert body["violations"] == []
+    assert body["gaps"] == []
+    result = client.get("/api/v1/batches/B1/result").json()
+    assert body["timeline_hash"] == result["timeline_hash"]
+    assert body["segments_hash"] == result["sensors"][0]["segments_hash"]
+
+
+def test_quality_gate_violation_requires_sustained_duration(client):
+    _post(client, _event("v1", "ROOT", 0, 100, value=1.0))
+    _post(client, _event("v2", "v1", 10, 30, value=9.0))  # 20ns OOB -> violation
+    _post(client, _event("v3", "v2", 50, 55, value=-2.0))  # 5ns blip -> ignored
+    body = _gate(client).json()
+    assert body["passed"] is False
+    assert [
+        (v["start_ns"], v["end_ns"], v["duration_ns"]) for v in body["violations"]
+    ] == [(10, 30, 20)]
+    assert body["violations"][0]["observed_min"] == 9.0
+    assert body["violations"][0]["observed_max"] == 9.0
+    # Raising the threshold above the sustained duration clears the violation.
+    assert _gate(client, min_duration_ns=21).json()["passed"] is True
+
+
+def test_quality_gate_merges_abutting_out_of_bounds_segments(client):
+    _post(client, _event("v1", "ROOT", 0, 10, value=5.0))
+    _post(client, _event("v2", "v1", 10, 25, value=6.0))
+    body = _gate(client, min_duration_ns=20).json()
+    assert body["passed"] is False
+    assert [
+        (v["start_ns"], v["end_ns"], v["observed_min"], v["observed_max"])
+        for v in body["violations"]
+    ] == [(0, 25, 5.0, 6.0)]
+
+
+def test_quality_gate_gaps_break_runs_and_follow_policy(client):
+    _post(client, _event("v1", "ROOT", 0, 10, value=9.0))
+    _post(client, _event("w", "v1", 10, 20, withdrawn=True, value=None))
+    _post(client, _event("v2", "w", 20, 30, value=9.0))
+    # Two 10ns OOB runs separated by a withdrawn span: no 15ns violation.
+    body = _gate(client, min_duration_ns=15).json()
+    assert body["passed"] is True
+    assert body["violations"] == []
+    assert [(g["start_ns"], g["end_ns"], g["state"]) for g in body["gaps"]] == [
+        (10, 20, "withdrawn")
+    ]
+    # fail policy: the recorded gap alone fails the gate.
+    assert _gate(client, min_duration_ns=15, missing_policy="fail").json()["passed"] is False
+    # ignore policy: gaps are not recorded at all.
+    ignored = _gate(client, min_duration_ns=15, missing_policy="ignore").json()
+    assert ignored["gaps"] == [] and ignored["passed"] is True
+
+
+def test_quality_gate_reports_uncovered_and_blocked_gaps(client):
+    _post(client, _event("v1", "ROOT", 0, 10, value=1.0))
+    _post(client, _event("lost", "ghost", 20, 30, value=2.0, key="kl"))
+    body = _gate(client).json()
+    assert body["passed"] is True  # warn policy: gaps do not fail the gate
+    assert [(g["start_ns"], g["end_ns"], g["state"]) for g in body["gaps"]] == [
+        (10, 20, "uncovered"),
+        (20, 30, "blocked"),
+    ]
+
+
+def test_quality_gate_blocked_gap_fails_under_fail_policy(client):
+    _post(client, _event("v2", "v1", 0, 10, value=2.0))  # parent missing
+    body = _gate(client, missing_policy="fail").json()
+    assert body["passed"] is False
+    assert body["violations"] == []
+    assert [g["state"] for g in body["gaps"]] == ["blocked"]
+
+
+def test_quality_gate_unknown_batch_or_sensor_404(client):
+    assert _gate(client, batch="NOPE").status_code == 404
+    _post(client, _event("v1", "ROOT", 0, 10, value=1.0, sensor="SX", key="kx"))
+    r = _gate(client)  # S1 unknown in B1
+    assert r.status_code == 404
+    assert "S1" in r.json()["detail"]
+
+
+def test_quality_gate_invalid_params_422(client):
+    _post(client, _event("v1", "ROOT", 0, 10, value=1.0))
+    # No bound at all.
+    assert _gate(client, min_value=None, max_value=None).status_code == 422
+    # Inverted bounds.
+    assert _gate(client, min_value=5.0, max_value=1.0).status_code == 422
+    # Non-positive duration threshold.
+    assert _gate(client, min_duration_ns=0).status_code == 422
+    # Unknown policy and unexpected field.
+    assert _gate(client, missing_policy="strict").status_code == 422
+    assert _gate(client, unknown_field=1).status_code == 422
+    # sensor_id missing entirely.
+    r = client.post(
+        "/api/v1/batches/B1/quality-gate",
+        json={"min_value": 0.0, "min_duration_ns": 1},
+    )
+    assert r.status_code == 422
+
+
+def test_quality_gate_deterministic_across_arrival_orders(client):
+    events = [
+        _event("r", "ROOT", 0, 100, value=1.0, key="kr"),
+        _event("a", "r", 0, 50, value=9.0, key="ka"),
+        _event("w", "a", 20, 30, withdrawn=True, value=None, key="kw"),
+        _event("b", "w", 30, 60, value=8.0, key="kb"),
+    ]
+
+    def run(order):
+        client.post("/admin/reset")
+        for e in order:
+            _post(client, e)
+        return _gate(client).json()
+
+    forward = run(events)
+    shuffled = run([events[2], events[0], events[3], events[1]])
+    assert forward == shuffled
+    assert forward["passed"] is False
+    assert [(v["start_ns"], v["end_ns"]) for v in forward["violations"]] == [
+        (0, 20),
+        (30, 60),
+    ]
+    assert [(g["start_ns"], g["end_ns"], g["state"]) for g in forward["gaps"]] == [
+        (20, 30, "withdrawn")
+    ]
+
+
+def test_openapi_lists_quality_gate(client):
+    spec = client.get("/openapi.json").json()
+    path = spec["paths"]["/api/v1/batches/{batch_id}/quality-gate"]["post"]
+    request_ref = path["requestBody"]["content"]["application/json"]["schema"]["$ref"]
+    response_ref = path["responses"]["200"]["content"]["application/json"]["schema"][
+        "$ref"
+    ]
+    assert request_ref.endswith("/QualityGateRequest")
+    assert response_ref.endswith("/QualityGateResponse")
+    assert "404" in path["responses"]
+
+
+# ---------------------------------------------------------------------------
 # Cross-batch comparison
 # ---------------------------------------------------------------------------
 

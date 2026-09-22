@@ -10,13 +10,21 @@ from fastapi.responses import JSONResponse
 
 from . import __version__
 from .config import get_settings
-from .engine import compare_sensor, evaluate_batch, evaluate_sample, find_sensor_events
+from .engine import (
+    compare_sensor,
+    evaluate_batch,
+    evaluate_quality_gate,
+    evaluate_sample,
+    find_sensor_events,
+)
 from .models import (
     BatchResult,
     CompareResponse,
     HealthResponse,
     IngestResponse,
     MeasurementEvent,
+    QualityGateRequest,
+    QualityGateResponse,
     ResetResponse,
     SamplePointResponse,
 )
@@ -47,7 +55,8 @@ app = FastAPI(
     description=(
         "Ingests out-of-order, overlapping and withdrawable measurement-fragment "
         "revisions for a sensor in a calibration batch and produces a deterministic "
-        "effective calibration timeline with backfillable gap reports."
+        "effective calibration timeline with backfillable gap reports, plus a "
+        "per-sensor quality gate over the folded timeline."
     ),
     lifespan=lifespan,
 )
@@ -193,6 +202,35 @@ def compare_batches(
             left_batch_id, right_batch_id, sensor_id, left_events, right_events
         )
     return CompareResponse(**doc)
+
+
+@app.post(
+    "/api/v1/batches/{batch_id}/quality-gate",
+    response_model=QualityGateResponse,
+    tags=["calibration"],
+    summary="Evaluate a quality gate over one sensor's folded timeline",
+    responses={404: {"description": "Unknown batch or sensor"}},
+)
+def quality_gate(batch_id: str, request: QualityGateRequest) -> QualityGateResponse:
+    batch = store.get_batch(batch_id)
+    if batch is None or not batch.events:
+        raise HTTPException(status_code=404, detail=f"batch {batch_id!r} not found")
+    with store.lock:
+        doc = evaluate_quality_gate(
+            batch_id,
+            request.sensor_id,
+            request.min_value,
+            request.max_value,
+            request.min_duration_ns,
+            request.missing_policy,
+            batch,
+        )
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"sensor {request.sensor_id!r} not found in batch {batch_id!r}",
+        )
+    return QualityGateResponse(**doc)
 
 
 @app.post(

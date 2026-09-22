@@ -443,6 +443,185 @@ def evaluate_batch(batch_id: str, store: BatchStore) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Quality gate
+# ---------------------------------------------------------------------------
+
+# Scan states recorded as gaps; they never join out-of-bounds candidate runs.
+GAP_STATES = ("withdrawn", "uncovered", "blocked")
+
+
+def _blocked_spans(
+    sensor_events: dict[str, StoredEvent], states: dict[str, str]
+) -> list[tuple[int, int]]:
+    """Union of every blocked revision's window, abutment-merged and sorted."""
+    merged: list[list[int]] = []
+    for start, end in sorted(
+        (event.start_ns, event.end_ns)
+        for event in sensor_events.values()
+        if states[event.revision_id] == BLOCKED
+    ):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
+
+
+def _out_of_bounds(
+    value: float, min_value: Optional[float], max_value: Optional[float]
+) -> bool:
+    """Inclusive bounds: a value exactly on a bound is in spec."""
+    return (min_value is not None and value < min_value) or (
+        max_value is not None and value > max_value
+    )
+
+
+def scan_quality_gate(
+    segments: list[Segment],
+    blocked_spans: list[tuple[int, int]],
+    min_value: Optional[float],
+    max_value: Optional[float],
+    min_duration_ns: int,
+    record_gaps: bool,
+) -> tuple[list[dict], list[dict]]:
+    """Sweep the folded timeline and emit ``(violations, gaps)``.
+
+    The scan domain is the half-open union of segment coverage and blocked
+    spans. Inside it every instant resolves to exactly one state, mirroring
+    the sample endpoint's precedence: ``blocked`` (a not-yet-grounded
+    revision covers the instant) wins over the folded segment state
+    (``calibrated``/``withdrawn``), which wins over ``uncovered``.
+
+    Out-of-bounds calibrated instants form candidate runs that merge across
+    abutting nanosecond boundaries; a run becomes a violation only when its
+    sustained duration reaches ``min_duration_ns``. Gap states break runs and
+    never merge into them; adjacent gap instants of the same state merge into
+    one gap interval (recorded only when ``record_gaps`` is true).
+    """
+    points = sorted(
+        {p for seg in segments for p in (seg.start_ns, seg.end_ns)}
+        | {p for span in blocked_spans for p in span}
+    )
+    violations: list[dict] = []
+    gaps: list[dict] = []
+    run: Optional[list] = None  # [start, end, observed_min, observed_max]
+    gap: Optional[list] = None  # [start, end, state]
+
+    def flush_run() -> None:
+        nonlocal run
+        if run is not None:
+            start, end, observed_min, observed_max = run
+            if end - start >= min_duration_ns:
+                violations.append(
+                    {
+                        "start_ns": start,
+                        "end_ns": end,
+                        "duration_ns": end - start,
+                        "observed_min": observed_min,
+                        "observed_max": observed_max,
+                    }
+                )
+            run = None
+
+    def flush_gap() -> None:
+        nonlocal gap
+        if gap is not None:
+            start, end, state = gap
+            gaps.append(
+                {
+                    "start_ns": start,
+                    "end_ns": end,
+                    "duration_ns": end - start,
+                    "state": state,
+                }
+            )
+            gap = None
+
+    si = bi = 0
+    for lo, hi in zip(points, points[1:]):
+        while bi < len(blocked_spans) and blocked_spans[bi][1] <= lo:
+            bi += 1
+        while si < len(segments) and segments[si].end_ns <= lo:
+            si += 1
+        if bi < len(blocked_spans) and blocked_spans[bi][0] <= lo:
+            state, value = "blocked", None
+        elif si < len(segments) and segments[si].start_ns <= lo:
+            state, value = segments[si].state, segments[si].value
+        else:
+            state, value = "uncovered", None
+
+        if state == "calibrated" and _out_of_bounds(value, min_value, max_value):
+            flush_gap()
+            if run is not None and run[1] == lo:
+                run[1] = hi
+                run[2] = min(run[2], value)
+                run[3] = max(run[3], value)
+            else:
+                flush_run()
+                run = [lo, hi, value, value]
+        elif state in GAP_STATES:
+            flush_run()
+            if record_gaps:
+                if gap is not None and gap[2] == state and gap[1] == lo:
+                    gap[1] = hi
+                else:
+                    flush_gap()
+                    gap = [lo, hi, state]
+        else:  # calibrated and within bounds
+            flush_run()
+            flush_gap()
+
+    flush_run()
+    flush_gap()
+    return violations, gaps
+
+
+def evaluate_quality_gate(
+    batch_id: str,
+    sensor_id: str,
+    min_value: Optional[float],
+    max_value: Optional[float],
+    min_duration_ns: int,
+    missing_policy: str,
+    store: BatchStore,
+) -> Optional[dict]:
+    """Evaluate the quality gate for one sensor; ``None`` when it is unknown.
+
+    ``passed`` is true when no violation was detected and the missing-data
+    policy does not fail on the recorded gaps. ``timeline_hash`` is the
+    batch-level hash of the full batch result, so gate responses can be
+    cross-checked against ``GET /api/v1/batches/{batch_id}/result``.
+    """
+    by_sensor = group_by_sensor(store)
+    sensor_events = by_sensor.get(sensor_id)
+    if sensor_events is None:
+        return None
+    states, depths = classify_sensor(sensor_events)
+    grounded = [
+        e for e in sensor_events.values() if states[e.revision_id] == GROUNDED
+    ]
+    segments = build_timeline(grounded, depths)
+    violations, gaps = scan_quality_gate(
+        segments,
+        _blocked_spans(sensor_events, states),
+        min_value,
+        max_value,
+        min_duration_ns,
+        record_gaps=missing_policy != "ignore",
+    )
+    passed = not violations and (missing_policy != "fail" or not gaps)
+    return {
+        "batch_id": batch_id,
+        "sensor_id": sensor_id,
+        "passed": passed,
+        "violations": violations,
+        "gaps": gaps,
+        "segments_hash": hash_segments(segments),
+        "timeline_hash": evaluate_batch(batch_id, store)["timeline_hash"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Cross-batch comparison
 # ---------------------------------------------------------------------------
 

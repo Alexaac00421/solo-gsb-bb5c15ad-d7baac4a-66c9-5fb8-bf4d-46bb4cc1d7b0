@@ -5,7 +5,9 @@
 按照**版本因果关系**与**时间区间切分规则**，生成一条**确定性**的有效标定时间线；
 当修订引用了尚未上传的父版本时，返回**可补传的缺口清单（gaps）**；
 重复提交通过幂等键保证**幂等**；还可对**两个批次的同一传感器**做
-**差异对比审计（compare）**。全部状态保存在**进程内存**中，可随时重置。
+**差异对比审计（compare）**，并能对单个传感器的折叠时间线做
+**质量门禁（quality gate）**判定（持续超界才算违规，缺失数据按策略记为缺口）。
+全部状态保存在**进程内存**中，可随时重置。
 
 ---
 
@@ -94,6 +96,12 @@ pytest -q
   传感器的有效时间线做半开区间差异扫描，只比较有效状态
   （`state`/`value`/`unit`），与修订来源（revision_id）及到达顺序无关；
   任一侧存在缺口或成环修订时标记 `incomplete` 并给出原因。
+- **质量门禁**（见 4.5）对已折叠时间线做确定性扫描：`calibrated` 值超出
+  允许上下限（闭区间）形成候选告警，相邻候选按纳秒合并为连续区间，
+  仅持续时长达到 `min_duration_ns` 才输出 violation；`withdrawn` /
+  `uncovered` / `blocked` 区间按 `missing_policy` 记录为缺口，且在任何
+  策略下都**不参与**候选合并（一定会打断连续超界）。判定结果与事件到达
+  顺序无关。
 
 ---
 
@@ -241,6 +249,67 @@ $ curl -s 'localhost:8080/api/v1/batches/compare?left_batch_id=B42&right_batch_i
 }
 ```
 
+### `POST /api/v1/batches/{batch_id}/quality-gate` — 质量门禁判定
+
+对指定传感器**已折叠的有效时间线**做确定性扫描，判定校准值是否持续超界。
+请求体：
+
+```json
+{
+  "sensor_id": "S1",
+  "min_value": 0.0,
+  "max_value": 4.0,
+  "min_duration_ns": 100,
+  "missing_policy": "warn"
+}
+```
+
+参数规则：
+
+- `min_value` / `max_value`：允许值的**闭区间**上下限，至少提供一个，
+  且 `min_value <= max_value`；恰好落在界上的值视为合格；
+- `min_duration_ns`：最短持续时长（纳秒整数，≥ 1）——超界候选区间持续
+  达到该阈值才记为 violation；
+- `missing_policy`：缺失数据策略，控制 `withdrawn` / `uncovered` /
+  `blocked` 区间的处理（三种策略下缺口都**不参与**超界候选的合并）：
+  - `ignore`：不记录缺口，不影响判定；
+  - `warn`（默认）：记录到 `gaps`，不影响判定；
+  - `fail`：记录到 `gaps`，且任一缺口即判 `passed=false`。
+
+扫描语义（状态优先级与采样点查询一致）：
+
+- 扫描域为已折叠片段与 blocked 修订窗口的并集跨度 `[min_start, max_end)`；
+  域内每个纳秒时刻解析为 `blocked`（覆盖该时刻的修订尚未落地，优先）、
+  折叠片段状态（`calibrated` / `withdrawn`）或 `uncovered` 之一；
+  覆盖开始前与结束后的时刻不在扫描域内，不产生缺口；
+- `calibrated` 且值超界 → 候选告警；相邻（端点相接）候选按纳秒合并为
+  连续区间，持续时长 ≥ `min_duration_ns` 才输出为 violation，并附带区间
+  内观测到的极值 `observed_min` / `observed_max`；
+- `withdrawn` / `uncovered` / `blocked` → 按策略记录为缺口，相邻同状态
+  缺口合并为一个区间；成环（invalid）修订与采样查询一样被完全忽略。
+
+响应示例（沿用第 5 节 B42 / S1 的时间线，门禁为 `[0, 3.0]`、阈值 50ns）：
+
+```json
+{
+  "batch_id": "B42",
+  "sensor_id": "S1",
+  "passed": false,
+  "violations": [
+    {"start_ns": 100, "end_ns": 200, "duration_ns": 100,
+     "observed_min": 3.5, "observed_max": 3.5}
+  ],
+  "gaps": [],
+  "segments_hash": "…",
+  "timeline_hash": "…"
+}
+```
+
+- `passed`：无 violation 且策略未因缺口判失败时为 `true`；
+- `segments_hash` / `timeline_hash`：与批次结果中的对应哈希一致，可交叉校验；
+- 批次或传感器不存在返回 `404`；上下限缺失或倒置、`min_duration_ns < 1`、
+  非法策略值、多余字段均返回 `422`。
+
 ### `POST /admin/reset` — 清空全部内存状态
 
 返回被清除的批次数与事件数。
@@ -272,6 +341,14 @@ curl -s localhost:8080/api/v1/batches/B42/result
 curl -s 'localhost:8080/api/v1/batches/B42/sensors/S1/sample?timestamp_ns=150'
 #   -> state="calibrated", value=3.5, revision_id="v2",
 #      parent_chain=["v2","v1","ROOT"]
+
+# 5) 质量门禁：S1 允许 [0, 3.0]，最短持续 50ns
+#    -> [100,200)=3.5 持续 100ns 超界，passed=false
+curl -s -X POST localhost:8080/api/v1/batches/B42/quality-gate \
+  -H 'Content-Type: application/json' \
+  -d '{"sensor_id":"S1","min_value":0.0,"max_value":3.0,
+       "min_duration_ns":50,"missing_policy":"warn"}'
+
 curl -s -X POST localhost:8080/admin/reset
 ```
 
@@ -292,12 +369,12 @@ curl -s -X POST localhost:8080/admin/reset
 ```
 .
 ├── app/
-│   ├── main.py       # FastAPI 路由：ingest / result / sample / compare / reset / health
-│   ├── engine.py     # 因果分类、区间切分折叠、采样点查询、跨批次差异对比、缺口与哈希（纯函数引擎）
+│   ├── main.py       # FastAPI 路由：ingest / result / sample / compare / quality-gate / reset / health
+│   ├── engine.py     # 因果分类、区间切分折叠、采样点查询、跨批次差异对比、质量门禁扫描、缺口与哈希（纯函数引擎）
 │   ├── storage.py    # 线程安全的内存存储与幂等判定
 │   ├── models.py     # Pydantic 请求/响应模型与校验
 │   └── config.py     # CAL_ 前缀环境变量配置
-├── tests/            # pytest（API 端到端 + 引擎单测，共 49 个用例）
+├── tests/            # pytest（API 端到端 + 引擎单测，共 70 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
