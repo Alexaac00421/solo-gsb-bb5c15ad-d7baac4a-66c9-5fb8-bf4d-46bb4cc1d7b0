@@ -5,6 +5,7 @@ Intervals are half-open ``[start_ns, end_ns)`` so that abutting fragments do
 not share any sample instant.
 """
 
+import math
 from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -178,6 +179,96 @@ class CompareResponse(StrictModel):
     # Contiguous, time-sorted partition of the union coverage span;
     # adjacent intervals merge when kind and both side payloads match.
     intervals: list[CompareInterval] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Quality gate
+# ---------------------------------------------------------------------------
+
+
+class QualityGateRequest(StrictModel):
+    """Parameters of one deterministic quality-gate evaluation."""
+
+    sensor_id: SensorId = Field(description="Sensor whose folded timeline is gated.")
+    # Inclusive allowed band for every effective ``calibrated`` value; values
+    # strictly below/above form candidate violations. Both bounds must be
+    # finite and min_value must not exceed max_value.
+    min_value: float = Field(description="Inclusive lower bound of the allowed band.")
+    max_value: float = Field(description="Inclusive upper bound of the allowed band.")
+    # A candidate violation is reported only when its merged span lasts at
+    # least this many nanoseconds (half-open duration = end_ns - start_ns).
+    min_duration_ns: int = Field(
+        ge=1,
+        description=(
+            "Minimum nanosecond duration of a merged out-of-band span for it "
+            "to be reported as a violation."
+        ),
+    )
+    # How missing data (withdrawn / uncovered / blocked spans) is handled:
+    #   fail   - gaps are reported and fail the gate (fail closed);
+    #   ignore - gaps are reported as information only and do not fail it.
+    missing_data_policy: Literal["fail", "ignore"] = Field(
+        default="fail",
+        description=(
+            "fail: any withdrawn/uncovered/blocked span fails the gate; "
+            "ignore: gaps are reported but do not affect pass/fail."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> "QualityGateRequest":
+        if not math.isfinite(self.min_value) or not math.isfinite(self.max_value):
+            raise ValueError("min_value and max_value must be finite")
+        if self.min_value > self.max_value:
+            raise ValueError("min_value must not be greater than max_value")
+        return self
+
+
+class ViolationInterval(StrictModel):
+    """One merged out-of-band span that lasted at least the threshold."""
+
+    start_ns: int
+    end_ns: int
+    duration_ns: int
+    # Which bound the merged span crosses; "mixed" means its elementary
+    # pieces cross different bounds.
+    side: Literal["below_min", "above_max", "mixed"]
+    # Most extreme value seen within the span (largest absolute deviation from
+    # the crossed bound), with its winning revision.
+    peak_value: float
+    peak_revision_id: str
+
+
+class GateGapInterval(StrictModel):
+    """One merged span without a usable calibrated value."""
+
+    start_ns: int
+    end_ns: int
+    duration_ns: int
+    # withdrawn: a tombstone wins the fold at the span;
+    # uncovered: no known revision (other than cyclic ones) covers it;
+    # blocked:   a not-yet-grounded revision covers it.
+    kind: Literal["withdrawn", "uncovered", "blocked"]
+    # Distinct not-yet-uploaded terminal ancestors covering a blocked span;
+    # empty for the other kinds (sorted, ready for backfill).
+    missing_ancestors: list[str] = Field(default_factory=list)
+
+
+class QualityGateResponse(StrictModel):
+    """Result of the deterministic quality-gate scan for one sensor."""
+
+    batch_id: str
+    sensor_id: str
+    status: Literal["pass", "fail"]
+    # Scan hull: union of every known, non-cyclic revision interval; null when
+    # the sensor has no usable revision at all (everything below is empty).
+    scan_start_ns: Optional[int] = None
+    scan_end_ns: Optional[int] = None
+    violations: list[ViolationInterval] = Field(default_factory=list)
+    gaps: list[GateGapInterval] = Field(default_factory=list)
+    # SHA-256 over the sensor's folded effective segments; identical to the
+    # per-sensor ``segments_hash`` of the batch result.
+    timeline_hash: str
 
 
 class IngestResponse(StrictModel):

@@ -10,6 +10,7 @@ from app.engine import (
     compare_segments,
     compare_sensor,
     evaluate_batch,
+    evaluate_quality_gate,
     query_sample,
 )
 from app.storage import BatchStore, StoredEvent
@@ -192,3 +193,208 @@ def test_compare_sensor_reports_blocked_and_invalid():
     assert [(i["start_ns"], i["end_ns"], i["kind"]) for i in doc["intervals"]] == [
         (0, 10, "left_only")
     ]
+
+
+# ---------------------------------------------------------------------------
+# Quality gate
+# ---------------------------------------------------------------------------
+
+
+def _gate_store(*events):
+    store = BatchStore()
+    for e in events:
+        store.events[e.revision_id] = e
+    return store
+
+
+def _gate(store, lo=0.0, hi=3.0, min_dur=1, policy="fail", batch="B", sensor="S"):
+    return evaluate_quality_gate(batch, sensor, lo, hi, min_dur, policy, store)
+
+
+def test_gate_all_in_band_passes_with_empty_lists():
+    store = _gate_store(_ev("r", "ROOT", 0, 100, value=1.0))
+    doc = _gate(store)
+    assert doc["status"] == "pass"
+    assert doc["violations"] == [] and doc["gaps"] == []
+    assert (doc["scan_start_ns"], doc["scan_end_ns"]) == (0, 100)
+
+
+def test_gate_below_min_and_above_max_candidate_runs():
+    # A compliant middle segment keeps the two runs apart; both out-of-band
+    # pieces are descendants so they win their windows over the root value.
+    store = _gate_store(
+        _ev("r", "ROOT", 0, 60, value=1.0),
+        _ev("low", "r", 0, 20, value=-1.0, key="low"),
+        _ev("high", "low", 40, 60, value=9.0, key="high"),
+    )
+    doc = _gate(store, 0.0, 3.0)
+    assert [
+        (v["start_ns"], v["end_ns"], v["side"], v["peak_revision_id"])
+        for v in doc["violations"]
+    ] == [(0, 20, "below_min", "low"), (40, 60, "above_max", "high")]
+    assert doc["violations"][0]["duration_ns"] == 20
+    assert doc["status"] == "fail"
+
+
+def test_gate_merges_abutting_violations_across_revision_boundaries():
+    store = _gate_store(
+        _ev("r", "ROOT", 0, 50, value=1.0),
+        _ev("a", "r", 10, 30, value=5.0),
+        _ev("b", "a", 30, 50, value=6.0),
+    )
+    doc = _gate(store, 0.0, 3.0, min_dur=40)
+    assert [
+        (v["start_ns"], v["end_ns"], v["duration_ns"], v["side"], v["peak_value"])
+        for v in doc["violations"]
+    ] == [(10, 50, 40, "above_max", 6.0)]
+    # The peak revision is the one carrying the most extreme value.
+    assert doc["violations"][0]["peak_revision_id"] == "b"
+
+
+def test_gate_mixed_sides_merge_and_report_mixed_side():
+    store = _gate_store(
+        _ev("a", "ROOT", 0, 40, value=-5.0, key="a"),
+        _ev("b", "a", 20, 60, value=8.0, key="b"),
+        _ev("c", "b", 0, 20, value=-1.0, key="c"),
+    )
+    doc = _gate(store, 0.0, 3.0, min_dur=50)
+    assert [
+        (v["start_ns"], v["end_ns"], v["side"], v["peak_value"], v["peak_revision_id"])
+        for v in doc["violations"]
+    ] == [(0, 60, "mixed", 8.0, "b")]
+
+
+def test_gate_min_duration_is_inclusive_and_filters_short_runs():
+    store = _gate_store(
+        _ev("r", "ROOT", 0, 100, value=1.0),
+        _ev("v4", "r", 70, 80, value=9.0, key="v4"),
+    )
+    assert _gate(store, 0.0, 3.0, min_dur=11)["violations"] == []
+    keep = _gate(store, 0.0, 3.0, min_dur=10)["violations"]
+    assert [(v["start_ns"], v["end_ns"]) for v in keep] == [(70, 80)]
+
+
+def test_gate_withdrawn_gap_breaks_violation_merge_and_fails_by_policy():
+    store = _gate_store(
+        _ev("r", "ROOT", 0, 30, value=9.0),
+        _ev("w", "r", 10, 20, withdrawn=True, key="w"),
+    )
+    fail = _gate(store, 0.0, 3.0, min_dur=15, policy="fail")
+    # Two 10ns violation runs are both below the 15ns threshold: no violation,
+    # but the withdrawn gap still fails the gate under policy="fail".
+    assert fail["violations"] == []
+    assert [(g["start_ns"], g["end_ns"], g["kind"]) for g in fail["gaps"]] == [
+        (10, 20, "withdrawn")
+    ]
+    assert fail["status"] == "fail"
+
+    ignored = _gate(store, 0.0, 3.0, min_dur=15, policy="ignore")
+    assert ignored["gaps"] and ignored["status"] == "pass"
+
+    # With threshold 10 both split runs are reported separately.
+    keep = _gate(store, 0.0, 3.0, min_dur=10, policy="ignore")
+    assert [(v["start_ns"], v["end_ns"]) for v in keep["violations"]] == [
+        (0, 10),
+        (20, 30),
+    ]
+
+
+def test_gate_uncovered_gap_inside_hull():
+    store = _gate_store(
+        _ev("a", "ROOT", 0, 10, value=1.0, key="a"),
+        _ev("b", "ROOT", 20, 30, value=2.0, key="b"),
+    )
+    doc = _gate(store, 0.0, 3.0)
+    assert [(g["start_ns"], g["end_ns"], g["duration_ns"], g["kind"]) for g in doc["gaps"]] == [
+        (10, 20, 10, "uncovered")
+    ]
+    assert doc["status"] == "fail"
+    assert _gate(store, 0.0, 3.0, policy="ignore")["status"] == "pass"
+
+
+def test_gate_blocked_span_is_gap_takes_precedence_and_merges():
+    store = _gate_store(
+        _ev("r", "ROOT", 0, 100, value=1.0),
+        _ev("o1", "g1", 10, 40, value=9.0, key="o1"),
+        _ev("o2", "g2", 40, 60, value=9.0, key="o2"),
+    )
+    doc = _gate(store, 0.0, 3.0)
+    assert [
+        (g["start_ns"], g["end_ns"], g["kind"], g["missing_ancestors"])
+        for g in doc["gaps"]
+    ] == [(10, 60, "blocked", ["g1", "g2"])]
+    # The grounded fold says 9.0 out-of-band there, but blocked wins.
+    assert doc["violations"] == []
+
+
+def test_gate_blocked_gap_union_overlapping_missing_sets():
+    store = _gate_store(
+        _ev("o1", "g1", 0, 20, value=9.0, key="o1"),
+        _ev("o2", "g2", 10, 30, value=9.0, key="o2"),
+    )
+    doc = _gate(store, 0.0, 3.0)
+    [gap] = doc["gaps"]
+    assert (gap["start_ns"], gap["end_ns"]) == (0, 30)
+    assert gap["missing_ancestors"] == ["g1", "g2"]
+    assert doc["scan_start_ns"] == 0 and doc["scan_end_ns"] == 30
+
+
+def test_gate_overlapping_blocked_intervals_with_nonmonotonic_ends():
+    # o1 starts earlier but outlives the middle blocked revision; after o2
+    # ends at t=20 only o1 must still cover [20, 60), and nothing after 60.
+    store = _gate_store(
+        _ev("r", "ROOT", 0, 100, value=1.0),
+        _ev("o1", "g1", 10, 60, value=9.0, key="o1"),
+        _ev("o2", "g2", 10, 20, value=9.0, key="o2"),
+    )
+    doc = _gate(store, 0.0, 3.0, policy="ignore")
+    assert [(g["start_ns"], g["end_ns"], g["kind"]) for g in doc["gaps"]] == [
+        (10, 60, "blocked")
+    ]
+    # No blocked coverage past 60, and the grounded 1.0 there is in band.
+    assert doc["violations"] == []
+
+
+def test_gate_gaps_of_different_kinds_never_merge():
+    store = _gate_store(
+        _ev("r", "ROOT", 0, 40, value=1.0),
+        _ev("w", "r", 0, 10, withdrawn=True, key="w"),
+        _ev("o", "ghost", 10, 20, value=9.0, key="o"),
+    )
+    doc = _gate(store, 0.0, 3.0, policy="ignore")
+    assert [(g["start_ns"], g["end_ns"], g["kind"]) for g in doc["gaps"]] == [
+        (0, 10, "withdrawn"),
+        (10, 20, "blocked"),
+    ]
+
+
+def test_gate_bounds_are_inclusive_and_equal_bounds_allowed():
+    store = _gate_store(_ev("r", "ROOT", 0, 30, value=5.0))
+    doc = _gate(store, 5.0, 5.0)
+    assert doc["status"] == "pass" and doc["violations"] == []
+
+
+def test_gate_cyclic_only_sensor_is_empty_scan_that_passes():
+    store = _gate_store(
+        _ev("c1", "c2", 0, 10, value=1.0, key="c1"),
+        _ev("c2", "c1", 0, 10, value=2.0, key="c2"),
+    )
+    doc = _gate(store)
+    assert doc["status"] == "pass"
+    assert doc["scan_start_ns"] is None and doc["scan_end_ns"] is None
+    assert doc["violations"] == [] and doc["gaps"] == []
+
+
+def test_gate_unknown_sensor_returns_none():
+    store = _gate_store(_ev("r", "ROOT", 0, 10, value=1.0))
+    assert evaluate_quality_gate("B", "NOPE", 0.0, 3.0, 1, "fail", store) is None
+
+
+def test_gate_timeline_hash_matches_folded_segments_hash():
+    store = _gate_store(
+        _ev("r", "ROOT", 0, 50, value=1.0),
+        _ev("a", "r", 10, 30, value=5.0),
+    )
+    gate_doc = _gate(store)
+    batch_doc = evaluate_batch("B", store)
+    assert gate_doc["timeline_hash"] == batch_doc["sensors"][0]["segments_hash"]

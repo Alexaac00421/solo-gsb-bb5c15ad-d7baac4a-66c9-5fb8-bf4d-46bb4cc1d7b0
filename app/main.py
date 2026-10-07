@@ -1,22 +1,32 @@
-"""FastAPI application: ingest, timeline/sample/compare query and reset endpoints."""
+"""FastAPI application: ingest, timeline/sample/compare/quality-gate query and reset endpoints."""
 
 from __future__ import annotations
 
 import logging
+import math
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import __version__
 from .config import get_settings
-from .engine import compare_sensor, evaluate_batch, evaluate_sample, find_sensor_events
+from .engine import (
+    compare_sensor,
+    evaluate_batch,
+    evaluate_quality_gate,
+    evaluate_sample,
+    find_sensor_events,
+)
 from .models import (
     BatchResult,
     CompareResponse,
     HealthResponse,
     IngestResponse,
     MeasurementEvent,
+    QualityGateRequest,
+    QualityGateResponse,
     ResetResponse,
     SamplePointResponse,
 )
@@ -63,6 +73,42 @@ async def conflict_handler(_: Request, exc: IdempotencyConflict) -> JSONResponse
                 "different event payload"
             )
         },
+    )
+
+
+def _json_safe(value: object) -> object:
+    """Coerce a pydantic error structure into JSON-encodable values.
+
+    Validation errors echo the rejected input: a literal ``Infinity`` or
+    ``NaN`` in a request body, or the exception object pydantic v2 keeps in
+    ``ctx``, would otherwise make the 422 response itself fail to serialize.
+    """
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Infinity" if value > 0 else "-Infinity"
+        return value
+    if isinstance(value, (str, int)):
+        return value
+    if isinstance(value, BaseException):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return str(value)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    _: Request, exc: RequestValidationError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _json_safe(exc.errors())},
     )
 
 
@@ -193,6 +239,35 @@ def compare_batches(
             left_batch_id, right_batch_id, sensor_id, left_events, right_events
         )
     return CompareResponse(**doc)
+
+
+@app.post(
+    "/api/v1/batches/{batch_id}/quality-gate",
+    response_model=QualityGateResponse,
+    tags=["calibration"],
+    summary="Evaluate the deterministic quality gate for one sensor",
+    responses={404: {"description": "Unknown batch or sensor"}},
+)
+def evaluate_gate(batch_id: str, gate: QualityGateRequest) -> QualityGateResponse:
+    batch = store.get_batch(batch_id)
+    if batch is None or not batch.events:
+        raise HTTPException(status_code=404, detail=f"batch {batch_id!r} not found")
+    with store.lock:
+        doc = evaluate_quality_gate(
+            batch_id,
+            gate.sensor_id,
+            gate.min_value,
+            gate.max_value,
+            gate.min_duration_ns,
+            gate.missing_data_policy,
+            batch,
+        )
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"sensor {gate.sensor_id!r} not found in batch {batch_id!r}",
+        )
+    return QualityGateResponse(**doc)
 
 
 @app.post(

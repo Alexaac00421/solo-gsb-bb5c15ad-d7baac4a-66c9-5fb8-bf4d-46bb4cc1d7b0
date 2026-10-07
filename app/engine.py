@@ -620,3 +620,217 @@ def compare_sensor(
         "incomplete_reasons": reasons,
         "intervals": compare_segments(left_segments, right_segments),
     }
+
+
+# ---------------------------------------------------------------------------
+# Quality gate
+# ---------------------------------------------------------------------------
+
+
+def _terminal_missing_ancestors(
+    revision_id: str, sensor_events: dict[str, StoredEvent]
+) -> set[str]:
+    """Distinct not-yet-uploaded revisions a blocked chain ends at.
+
+    Walks the parent chain while parents are known; the first unknown parent
+    is the backfillable terminal ancestor. Mirrors the sample-point rule.
+    """
+    missing: set[str] = set()
+    parent = sensor_events[revision_id].parent_id
+    while parent != ROOT_PARENT and parent in sensor_events:
+        parent = sensor_events[parent].parent_id
+    if parent != ROOT_PARENT:
+        missing.add(parent)
+    return missing
+
+
+def evaluate_quality_gate(
+    batch_id: str,
+    sensor_id: str,
+    min_value: float,
+    max_value: float,
+    min_duration_ns: int,
+    missing_data_policy: str,
+    store: BatchStore,
+) -> Optional[dict]:
+    """Run the deterministic quality-gate scan for one sensor.
+
+    Returns ``None`` when the sensor is unknown in this batch.
+
+    The scan hull is the union of every known, non-cyclic revision interval:
+    grounded revisions contribute their folded effective segments; blocked
+    revisions contribute their raw (claimed) intervals. It is partitioned at
+    every boundary into elementary half-open spans, each classified exactly
+    once:
+
+    * a ``calibrated`` segment with value below/above the allowed band starts
+      a candidate violation; adjacent candidate spans merge in nanosecond
+      order (even across revision boundaries) and are emitted only when the
+      merged duration reaches ``min_duration_ns``;
+    * ``withdrawn`` segments, uncovered spans and spans covered by a blocked
+      revision are recorded as gaps and never merge with violations (blocked
+      takes precedence wherever a blocked revision covers the span).
+
+    The gate fails when at least one threshold-reaching violation exists, or
+    when any gap exists and the policy is ``"fail"``.
+    """
+    by_sensor = group_by_sensor(store)
+    sensor_events = by_sensor.get(sensor_id)
+    if sensor_events is None:
+        return None
+
+    states, depths = classify_sensor(sensor_events)
+    grounded_events = [
+        e for e in sensor_events.values() if states[e.revision_id] == GROUNDED
+    ]
+    segments = build_timeline(grounded_events, depths)
+    blocked_events = sorted(
+        (e for rev, e in sensor_events.items() if states[rev] == BLOCKED),
+        key=lambda e: (e.start_ns, e.end_ns, e.revision_id),
+    )
+
+    # Cyclic (invalid) revisions are structurally unusable and excluded from
+    # both the hull and every classification.
+    boundary_items = list(segments) + blocked_events
+    if not boundary_items:
+        return {
+            "batch_id": batch_id,
+            "sensor_id": sensor_id,
+            "status": "pass",
+            "scan_start_ns": None,
+            "scan_end_ns": None,
+            "violations": [],
+            "gaps": [],
+            "timeline_hash": hash_segments(segments),
+        }
+
+    points = sorted({p for item in boundary_items for p in (item.start_ns, item.end_ns)})
+
+    # Accumulators for the current contiguous run:
+    run_kind: Optional[str] = None  # "violation" | "gap" | "ok"
+    run_start = run_end = 0
+    run_sides: set[str] = set()
+    run_gap_kind: Optional[str] = None
+    run_missing: set[str] = set()
+    run_peak: Optional[tuple] = None  # (deviation, abs(value), rev, value)
+    violation_runs: list[dict] = []
+    gap_runs: list[dict] = []
+
+    def flush() -> None:
+        nonlocal run_kind, run_sides, run_gap_kind, run_missing, run_peak
+        if run_kind is None:
+            return
+        duration = run_end - run_start
+        if run_kind == "violation":
+            if duration >= min_duration_ns:
+                side = next(iter(run_sides)) if len(run_sides) == 1 else "mixed"
+                _, _, peak_rev, peak_value = run_peak
+                violation_runs.append(
+                    {
+                        "start_ns": run_start,
+                        "end_ns": run_end,
+                        "duration_ns": duration,
+                        "side": side,
+                        "peak_value": float(peak_value),
+                        "peak_revision_id": peak_rev,
+                    }
+                )
+        elif run_kind == "gap":
+            gap_runs.append(
+                {
+                    "start_ns": run_start,
+                    "end_ns": run_end,
+                    "duration_ns": duration,
+                    "kind": run_gap_kind,
+                    "missing_ancestors": sorted(run_missing),
+                }
+            )
+        run_kind = None
+        run_sides = set()
+        run_gap_kind = None
+        run_missing = set()
+        run_peak = None
+
+    si = bi = 0
+    for lo, hi in zip(points, points[1:]):
+        while si < len(segments) and segments[si].end_ns <= lo:
+            si += 1
+        while bi < len(blocked_events) and blocked_events[bi].start_ns <= lo:
+            # blocked events are start-sorted; advance past ones whose start
+            # can never cover this or a later cell (ends are not monotonic,
+            # so the half-open end check below still applies to the rest).
+            bi += 1
+        covering_blocked = [
+            e for e in blocked_events[:bi] if e.end_ns > lo
+        ]
+
+        if covering_blocked:
+            kind, gap_kind, side = "gap", "blocked", None
+            missing: set[str] = set()
+            for e in covering_blocked:
+                missing |= _terminal_missing_ancestors(e.revision_id, sensor_events)
+            value = rev = None
+        else:
+            seg = segments[si] if si < len(segments) and segments[si].start_ns <= lo else None
+            missing = set()
+            if seg is None:
+                kind, gap_kind, side = "gap", "uncovered", None
+                value = rev = None
+            elif seg.state == "withdrawn":
+                kind, gap_kind, side = "gap", "withdrawn", None
+                value = rev = None
+            elif seg.value < min_value:
+                kind, gap_kind, side = "violation", None, "below_min"
+                value, rev = seg.value, seg.revision_id
+            elif seg.value > max_value:
+                kind, gap_kind, side = "violation", None, "above_max"
+                value, rev = seg.value, seg.revision_id
+            else:
+                kind, gap_kind, side = "ok", None, None
+                value = rev = None
+
+        # Extend the current run only when the classification is compatible;
+        # gaps merge only with the same gap kind, violations with violations.
+        same_run = (
+            run_kind is not None
+            and run_end == lo
+            and run_kind == kind
+            and (kind != "gap" or run_gap_kind == gap_kind)
+        )
+        if not same_run:
+            flush()
+            run_kind, run_start, run_end = kind, lo, hi
+            if kind == "violation":
+                run_sides = {side}
+                deviation = (min_value - value) if side == "below_min" else (value - max_value)
+                run_peak = (deviation, abs(value), rev, value)
+            elif kind == "gap":
+                run_gap_kind = gap_kind
+                run_missing = set(missing)
+        else:
+            run_end = hi
+            if kind == "violation":
+                run_sides.add(side)
+                deviation = (min_value - value) if side == "below_min" else (value - max_value)
+                candidate = (deviation, abs(value), rev, value)
+                if run_peak is None or candidate > run_peak:
+                    run_peak = candidate
+            elif kind == "gap":
+                run_missing |= missing
+
+    flush()
+
+    failed = bool(violation_runs) or (
+        missing_data_policy == "fail" and bool(gap_runs)
+    )
+    return {
+        "batch_id": batch_id,
+        "sensor_id": sensor_id,
+        "status": "fail" if failed else "pass",
+        "scan_start_ns": points[0],
+        "scan_end_ns": points[-1],
+        "violations": violation_runs,
+        "gaps": gap_runs,
+        "timeline_hash": hash_segments(segments),
+    }
+

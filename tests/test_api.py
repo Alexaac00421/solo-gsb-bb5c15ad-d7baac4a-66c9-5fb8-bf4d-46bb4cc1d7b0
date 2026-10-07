@@ -1,5 +1,12 @@
 """End-to-end API behavior: causality, gaps, withdrawals, idempotency."""
 
+import json
+
+import pytest
+from pydantic import ValidationError
+
+from app.models import QualityGateRequest
+
 
 def _event(rev, parent, start, end, value=None, withdrawn=False, key=None,
            batch="B1", sensor="S1", unit="mm"):
@@ -518,3 +525,216 @@ def test_compare_invalid_params_422(client):
     assert _compare(client, left="").status_code == 422
     assert _compare(client, right="").status_code == 422
     assert _compare(client, sensor="").status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Quality gate
+# ---------------------------------------------------------------------------
+
+
+def _gate(client, body, batch="B1"):
+    return client.post(f"/api/v1/batches/{batch}/quality-gate", json=body)
+
+
+def _gate_body(sensor="S1", lo=0.0, hi=3.0, min_dur=1, policy="fail"):
+    return {
+        "sensor_id": sensor,
+        "min_value": lo,
+        "max_value": hi,
+        "min_duration_ns": min_dur,
+        "missing_data_policy": policy,
+    }
+
+
+def test_gate_in_band_passes(client):
+    _post(client, _event("v1", "ROOT", 0, 100, value=1.0))
+    r = _gate(client, _gate_body())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "pass"
+    assert body["violations"] == [] and body["gaps"] == []
+    assert (body["batch_id"], body["sensor_id"]) == ("B1", "S1")
+    assert (body["scan_start_ns"], body["scan_end_ns"]) == (0, 100)
+    assert len(body["timeline_hash"]) == 64
+
+
+def test_gate_violation_merges_abutting_out_of_band_segments(client):
+    _post(client, _event("v1", "ROOT", 0, 100, value=1.0))
+    _post(client, _event("v2", "v1", 10, 30, value=5.0))
+    _post(client, _event("v3", "v2", 30, 50, value=6.0))
+    # 40ns merged run; a 25ns threshold keeps it.
+    r = _gate(client, _gate_body(min_dur=25))
+    body = r.json()
+    assert body["status"] == "fail"
+    [violation] = body["violations"]
+    assert (
+        violation["start_ns"],
+        violation["end_ns"],
+        violation["duration_ns"],
+        violation["side"],
+    ) == (10, 50, 40, "above_max")
+    assert violation["peak_value"] == 6.0 and violation["peak_revision_id"] == "v3"
+    # Raising the threshold above the merged length clears the violation.
+    assert _gate(client, _gate_body(min_dur=41)).json()["violations"] == []
+
+
+def test_gate_short_out_of_band_blip_below_threshold_passes(client):
+    _post(client, _event("v1", "ROOT", 0, 100, value=1.0))
+    _post(client, _event("v2", "v1", 70, 80, value=-5.0))
+    body = _gate(client, _gate_body(min_dur=11)).json()
+    assert body["status"] == "pass" and body["violations"] == [] and body["gaps"] == []
+
+
+def test_gate_withdrawn_gap_breaks_violation_merging(client):
+    _post(client, _event("v1", "ROOT", 0, 30, value=9.0))
+    _post(client, _event("w", "v1", 10, 20, withdrawn=True, value=None))
+    # Each side of the tombstone is 10ns out of band; threshold 15 hides both.
+    body = _gate(client, _gate_body(min_dur=15, policy="ignore")).json()
+    assert body["violations"] == []
+    assert [(g["start_ns"], g["end_ns"], g["kind"]) for g in body["gaps"]] == [
+        (10, 20, "withdrawn")
+    ]
+    # At threshold 10 the two runs survive and stay separated.
+    body = _gate(client, _gate_body(min_dur=10, policy="ignore")).json()
+    assert [(v["start_ns"], v["end_ns"]) for v in body["violations"]] == [
+        (0, 10),
+        (20, 30),
+    ]
+
+
+def test_gate_uncovered_gap_within_scan_hull(client):
+    _post(client, _event("a", "ROOT", 0, 10, value=1.0, key="a"))
+    _post(client, _event("b", "ROOT", 20, 30, value=2.0, key="b"))
+    fail = _gate(client, _gate_body()).json()
+    assert [(g["start_ns"], g["end_ns"], g["duration_ns"], g["kind"]) for g in fail["gaps"]] == [
+        (10, 20, 10, "uncovered")
+    ]
+    assert fail["status"] == "fail"
+    passed = _gate(client, _gate_body(policy="ignore")).json()
+    assert passed["status"] == "pass" and passed["gaps"] == fail["gaps"]
+
+
+def test_gate_blocked_gap_takes_precedence_over_out_of_band_fold(client):
+    _post(client, _event("v1", "ROOT", 0, 100, value=1.0))
+    _post(client, _event("orphan", "ghost", 40, 60, value=9.0, key="ko"))
+    body = _gate(client, _gate_body()).json()
+    [gap] = body["gaps"]
+    assert (gap["start_ns"], gap["end_ns"], gap["kind"]) == (40, 60, "blocked")
+    assert gap["missing_ancestors"] == ["ghost"]
+    assert body["violations"] == []
+    assert body["status"] == "fail"
+    # Backfill resolves the block; the now-grounded out-of-band span violates.
+    _post(client, _event("ghost", "ROOT", 40, 60, value=9.0, key="kg"))
+    body = _gate(client, _gate_body(min_dur=20)).json()
+    assert body["gaps"] == []
+    assert [(v["start_ns"], v["end_ns"]) for v in body["violations"]] == [(40, 60)]
+
+
+def test_gate_missing_data_policy_ignore_still_fails_on_violation(client):
+    _post(client, _event("v1", "ROOT", 0, 30, value=9.0))
+    _post(client, _event("w", "v1", 10, 20, withdrawn=True, value=None))
+    body = _gate(client, _gate_body(min_dur=10, policy="ignore")).json()
+    # Gaps are tolerated, but the two out-of-band runs still fail the gate.
+    assert body["status"] == "fail"
+    assert len(body["violations"]) == 2 and len(body["gaps"]) == 1
+
+
+def test_gate_boundary_values_are_allowed(client):
+    _post(client, _event("v1", "ROOT", 0, 30, value=0.0))
+    _post(client, _event("v2", "v1", 0, 15, value=3.0))
+    body = _gate(client, _gate_body()).json()
+    assert body["status"] == "pass" and body["violations"] == []
+
+
+def test_gate_timeline_hash_matches_batch_result(client):
+    _post(client, _event("v1", "ROOT", 0, 50, value=1.0))
+    _post(client, _event("v2", "v1", 10, 30, value=5.0))
+    gate_hash = _gate(client, _gate_body()).json()["timeline_hash"]
+    result_hash = client.get("/api/v1/batches/B1/result").json()["sensors"][0][
+        "segments_hash"
+    ]
+    assert gate_hash == result_hash
+
+
+def test_gate_is_deterministic_across_arrival_order(client):
+    def run(events):
+        client.post("/admin/reset")
+        for e in events:
+            _post(client, e)
+        return _gate(client, _gate_body(min_dur=15)).json()
+
+    events = [
+        _event("r", "ROOT", 0, 100, value=1.0),
+        _event("a", "r", 0, 50, value=8.0, key="ka"),
+        _event("w", "a", 40, 60, withdrawn=True, value=None, key="kw"),
+    ]
+    first = run(events)
+    second = run(list(reversed(events)))
+    assert first == second
+
+
+def test_gate_unknown_batch_or_sensor_404(client):
+    body = _gate_body()
+    assert _gate(client, body, batch="NOPE").status_code == 404
+    _post(client, _event("v1", "ROOT", 0, 10, value=1.0, sensor="SX", key="kx"))
+    r = _gate(client, _gate_body(sensor="SY"))
+    assert r.status_code == 404
+    assert "SY" in r.json()["detail"] and "B1" in r.json()["detail"]
+    client.post("/admin/reset")
+    assert _gate(client, body).status_code == 404
+
+
+def test_gate_invalid_params_422(client):
+    _post(client, _event("v1", "ROOT", 0, 10, value=1.0))
+    url = "/api/v1/batches/B1/quality-gate"
+    # min_value greater than max_value.
+    r = client.post(url, json=_gate_body(lo=5.0, hi=1.0))
+    assert r.status_code == 422
+    # Non-finite bounds. Python's permissive JSON parser accepts the
+    # Infinity/NaN literals; the model validator rejects them and the custom
+    # 422 handler must still serialise (it cannot echo a raw non-finite float).
+    headers = {"Content-Type": "application/json"}
+    for token in ("Infinity", "-Infinity", "NaN"):
+        payload = _gate_body()
+        payload["min_value"] = token
+        r = client.post(url, content=json.dumps(payload), headers=headers)
+        assert r.status_code == 422, token
+        assert r.headers["content-type"].startswith("application/json")
+    # A genuinely malformed numeric token fails JSON parsing.
+    malformed = json.dumps(_gate_body()).replace("0.0", "1e", 1)
+    assert client.post(url, content=malformed, headers=headers).status_code == 422
+    # The model validator rejects non-finite floats directly as well.
+    with pytest.raises(ValidationError):
+        QualityGateRequest(
+            sensor_id="S1",
+            min_value=float("inf"),
+            max_value=3.0,
+            min_duration_ns=1,
+        )
+    with pytest.raises(ValidationError):
+        QualityGateRequest(
+            sensor_id="S1",
+            min_value=0.0,
+            max_value=float("nan"),
+            min_duration_ns=1,
+        )
+    # min_duration_ns must be >= 1.
+    assert client.post(url, json=_gate_body(min_dur=0)).status_code == 422
+    assert client.post(url, json=_gate_body(min_dur=-3)).status_code == 422
+    # Unknown policy.
+    assert client.post(url, json=_gate_body(policy="warn")).status_code == 422
+    # Missing sensor_id / fields.
+    assert client.post(url, json={"min_value": 0.0}).status_code == 422
+    # Extra fields are forbidden (strict models).
+    payload = _gate_body()
+    payload["unexpected"] = 1
+    assert client.post(url, json=payload).status_code == 422
+
+
+def test_gate_openapi_schema_documents_endpoint(client):
+    schema = client.get("/openapi.json").json()
+    op = schema["paths"]["/api/v1/batches/{batch_id}/quality-gate"]["post"]
+    assert "QualityGate" in op["summary"] or "quality gate" in op["summary"].lower()
+    body_schema = op["requestBody"]["content"]["application/json"]["schema"]["$ref"]
+    assert body_schema.endswith("QualityGateRequest")
+    assert "QualityGateResponse" in json.dumps(schema["components"]["schemas"])
